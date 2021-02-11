@@ -14,27 +14,44 @@ pub fn call_one() -> i32 {
 
 pub struct ThreadPool {
     workers: Vec<Worker>,
-    sender: mpsc::Sender<Job>,
+    sender: mpsc::Sender<Message>,
 }
 
 struct Worker {
     id: usize,
-    thread: thread::JoinHandle<()>,
+    thread: Option<thread::JoinHandle<()>>,
 }
 
 type Job = Box<dyn FnOnce() + Send + 'static>;
 
+enum Message {
+    NewJob(Job),
+    Terminate,
+}
+
 impl Worker {
-    fn new(id: usize, receiver: Arc<Mutex<mpsc::Receiver<Job>>>) -> Worker {
+    fn new(id: usize, receiver: Arc<Mutex<mpsc::Receiver<Message>>>) -> Worker {
         let thread = thread::spawn(move || loop { 
-            let job = receiver.lock().unwrap().recv().unwrap();
+            let message = receiver.lock().unwrap().recv().unwrap();
 
-            println!("Worker {} god a job; executing.", id);
+            match message {
+                Message::NewJob(job) => {
+                    println!("Worker {} god a job; executing.", id);
+                    
+                    job();
+                }
+                Message::Terminate => {
+                    println!("Worker {} was told terminate.", id);
 
-            job();
+                    break;
+                }
+            }
         });
 
-        Worker { id, thread }
+        Worker { 
+            id, 
+            thread: Some(thread),
+        }
     }
 }
 
@@ -64,7 +81,27 @@ impl ThreadPool {
     pub fn execute<F>(&self, f: F) where F: FnOnce() + Send + 'static {
         let job = Box::new(f);
 
-        self.sender.send(job).unwrap();
+        self.sender.send(Message::NewJob(job)).unwrap();
+    }
+}
+
+impl Drop for ThreadPool {
+    fn drop(&mut self) {
+        println!("Sending terminate message to all worekrs.");
+
+        for _ in &self.workers {
+            self.sender.send(Message::Terminate).unwrap();
+        }
+
+        println!("Shutting down all workers.");
+
+        for worker in &mut self.workers {
+            println!("Shutting down worekr {}.", worker.id);
+
+            if let Some(thread) = worker.thread.take() {
+                thread.join().unwrap();
+            }
+        }
     }
 }
 
@@ -79,6 +116,8 @@ pub fn create_server() {
             handle_connection(stream);
         });
     }
+
+    println!("Shutting down!");
 }
 
 fn handle_connection(mut stream: TcpStream) {
@@ -88,7 +127,6 @@ fn handle_connection(mut stream: TcpStream) {
     let get = b"GET / HTTP/1.1\r\n";
     let sleep = b"GET /sleep HTTP/1.1\r\n";
 
-    // println!("Request: {}", String::from_utf8_lossy(&buffer));
     let (status_line, filename) = if buffer.starts_with(get) {
         ("HTTP/1.1 200 OK\r\n\r\n", "hello.html")
     } else if buffer.starts_with(sleep) {
